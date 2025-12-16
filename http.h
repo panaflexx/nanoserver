@@ -1,0 +1,287 @@
+#ifndef HTTP_PARSER_H
+#define HTTP_PARSER_H
+
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+#include "stringbuf.h"
+#ifndef INCLUDE_STB_DS_H
+#  include "stb_ds.h"
+#endif
+
+struct http_header {
+    char *key;
+    char *value;
+};
+
+struct http_request {
+    char *method;
+    char *uri;
+    char *version;
+    struct http_header *headers;
+    char *body;
+    size_t body_len;
+};
+
+struct http_response {
+    int status_code;
+    char *reason_phrase;
+    struct http_header *headers;
+    char *body;
+    size_t body_len;
+};
+
+enum http_parser_state {
+    HP_REQUEST_LINE,
+    HP_HEADERS,
+    HP_BODY,
+    HP_DONE,
+    HP_ERROR
+};
+
+struct http_parser {
+    enum http_parser_state state;
+    StringBuf buffer;
+    size_t pos;
+    struct http_request req;
+    size_t content_length;
+    bool chunked;
+};
+
+static inline void http_parser_init(struct http_parser *parser) {
+    memset(parser, 0, sizeof(*parser));
+    parser->state = HP_REQUEST_LINE;
+    stringbuf_init(&parser->buffer, 0);
+}
+
+static inline void http_parser_reset(struct http_parser *parser) {
+    shfree(parser->req.headers);
+    free(parser->req.method);
+    free(parser->req.uri);
+    free(parser->req.version);
+    free(parser->req.body);
+    stringbuf_free(&parser->buffer);
+    http_parser_init(parser);
+}
+
+static inline void http_parser_destroy(struct http_parser *parser) {
+    http_parser_reset(parser);
+}
+
+static inline int http_parser_feed(struct http_parser *parser, const char *data, size_t len) {
+    if (!parser || !data) return -1;
+
+    // Append incoming data to buffer
+    if (!stringbuf_append(&parser->buffer, data, len)) {
+        parser->state = HP_ERROR;
+        return -1;
+    }
+
+    const char *buf = stringbuf_cstr(&parser->buffer);
+    size_t buflen = stringbuf_size(&parser->buffer);
+
+    while (parser->state != HP_DONE && parser->state != HP_ERROR && parser->pos < buflen) {
+        switch (parser->state) {
+            case HP_REQUEST_LINE: {
+                ssize_t line_end_pos = stringbuf_memchr(&parser->buffer, '\n', parser->pos);
+                if (line_end_pos == -1) return 0; // Need more data
+
+                size_t line_len = line_end_pos - parser->pos;
+                const char *line_start = buf + parser->pos;
+                if (line_end_pos > 0 && buf[line_end_pos - 1] == '\r') line_len--;
+
+                ssize_t space1_pos = stringbuf_find(&parser->buffer, parser->pos, " ", 1);
+                if (space1_pos == -1) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
+                parser->req.method = strndup(line_start, space1_pos - parser->pos);
+
+                ssize_t space2_pos = stringbuf_find(&parser->buffer, space1_pos + 1, " ", 1);
+                if (space2_pos == -1) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
+                parser->req.uri = strndup(buf + space1_pos + 1, space2_pos - (space1_pos + 1));
+
+                parser->req.version = strndup(buf + space2_pos + 1, line_end_pos - (space2_pos + 1));
+
+                parser->pos = line_end_pos + 1;
+                parser->state = HP_HEADERS;
+                break;
+            }
+            case HP_HEADERS: {
+                ssize_t line_end_pos = stringbuf_memchr(&parser->buffer, '\n', parser->pos);
+                if (line_end_pos == -1) return 0; // Need more data
+
+                size_t line_len = line_end_pos - parser->pos;
+                const char *line_start = buf + parser->pos;
+                if (line_end_pos > 0 && buf[line_end_pos - 1] == '\r') line_len--;
+
+                if (line_len == 0) {
+                    // End of headers
+                    parser->pos = line_end_pos + 1;
+
+                    ptrdiff_t cl_idx = shgeti(parser->req.headers, "Content-Length");
+                    if (cl_idx >= 0) {
+                        parser->content_length = (size_t)strtoul(parser->req.headers[cl_idx].value, NULL, 10);
+                        parser->chunked = false;
+                    } else {
+                        ptrdiff_t te_idx = shgeti(parser->req.headers, "Transfer-Encoding");
+                        if (te_idx >= 0 && strcasecmp(parser->req.headers[te_idx].value, "chunked") == 0) {
+                            parser->chunked = true;
+                            parser->content_length = 0;
+                        } else {
+                            parser->content_length = 0;
+                        }
+                    }
+
+                    if (parser->content_length > 0 || parser->chunked) {
+                        parser->state = HP_BODY;
+                    } else {
+                        parser->state = HP_DONE;
+                    }
+                    break;
+                }
+
+                ssize_t colon_pos = stringbuf_memchr(&parser->buffer, ':', parser->pos);
+                if (colon_pos == -1) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
+
+                size_t name_start = parser->pos;
+                size_t name_end = colon_pos;
+                while (name_start < name_end && isspace((unsigned char)buf[name_start])) ++name_start;
+                while (name_end > name_start && isspace((unsigned char)buf[name_end - 1])) --name_end;
+
+                size_t value_start = colon_pos + 1;
+                size_t value_end = line_end_pos;
+                while (value_start < value_end && isspace((unsigned char)buf[value_start])) ++value_start;
+                while (value_end > value_start && isspace((unsigned char)buf[value_end - 1])) --value_end;
+
+                char *key = strndup(buf + name_start, name_end - name_start);
+                char *value = strndup(buf + value_start, value_end - value_start);
+
+                struct http_header h = {.key = key, .value = value};
+                shputs(parser->req.headers, h);
+
+                parser->pos = line_end_pos + 1;
+                break;
+            }
+            case HP_BODY: {
+                if (!parser->chunked) {
+                    size_t remaining = parser->content_length - parser->req.body_len;
+                    size_t avail = buflen - parser->pos;
+                    if (avail == 0) return 0;
+
+                    size_t consume = (remaining < avail) ? remaining : avail;
+                    parser->req.body = (char *)realloc(parser->req.body, parser->req.body_len + consume);
+                    memcpy(parser->req.body + parser->req.body_len, buf + parser->pos, consume);
+                    parser->req.body_len += consume;
+                    parser->pos += consume;
+
+                    if (parser->req.body_len == parser->content_length) {
+                        parser->state = HP_DONE;
+                    }
+                } else {
+                    // Basic chunked parsing (no extensions, trailers)
+                    while (parser->pos < buflen) {
+                        if (parser->content_length == 0) { // Parse chunk size
+                            ssize_t line_end_pos = stringbuf_memchr(&parser->buffer, '\n', parser->pos);
+                            if (line_end_pos == -1) return 0;
+
+                            size_t line_len = line_end_pos - parser->pos;
+                            if (line_end_pos > 0 && buf[line_end_pos - 1] == '\r') line_len--;
+
+                            char line[32];
+                            if (line_len >= sizeof(line)) {
+                                parser->state = HP_ERROR;
+                                return -1;
+                            }
+                            memcpy(line, buf + parser->pos, line_len);
+                            line[line_len] = '\0';
+
+                            char *semi = strchr(line, ';');
+                            if (semi) *semi = '\0';
+
+                            parser->content_length = (size_t)strtoul(line, NULL, 16);
+                            if (parser->content_length == 0) {
+                                parser->state = HP_DONE;
+                                parser->pos = line_end_pos + 1;
+                                break;
+                            }
+                            parser->pos = line_end_pos + 1;
+                        } else { // Parse chunk data
+                            size_t avail = buflen - parser->pos;
+                            if (avail < parser->content_length + 2) return 0;
+
+                            if (memcmp(buf + parser->pos + parser->content_length, "\r\n", 2) != 0) {
+                                parser->state = HP_ERROR;
+                                return -1;
+                            }
+
+                            parser->req.body = (char *)realloc(parser->req.body, parser->req.body_len + parser->content_length);
+                            memcpy(parser->req.body + parser->req.body_len, buf + parser->pos, parser->content_length);
+                            parser->req.body_len += parser->content_length;
+                            parser->pos += parser->content_length + 2;
+                            parser->content_length = 0;
+                        }
+                    }
+                }
+                // Shift remaining buffer data left if any
+                if (parser->pos > 0 && parser->pos < buflen) {
+                    stringbuf_consume(&parser->buffer, parser->pos);
+                    parser->pos = 0;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    if (parser->state == HP_DONE) return 1;
+    if (parser->state == HP_ERROR) return -1;
+    return 0;
+}
+
+static inline size_t http_build_response(const struct http_response *resp, char *buf, size_t buf_size) {
+    char status_line[64];
+    snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n", resp->status_code, resp->reason_phrase ? resp->reason_phrase : "");
+    size_t len = strlen(status_line);
+    if (len >= buf_size) return 0;
+    memcpy(buf, status_line, len);
+
+    struct http_header *headers = resp->headers;
+    for (ptrdiff_t i = 0; i < shlen(headers); ++i) {
+        char header_line[512];
+        size_t hlen = snprintf(header_line, sizeof(header_line), "%s: %s\r\n", headers[i].key, headers[i].value);
+        if (len + hlen >= buf_size) return 0;
+        memcpy(buf + len, header_line, hlen);
+        len += hlen;
+    }
+
+    char cl_header[64];
+    size_t cl_len = snprintf(cl_header, sizeof(cl_header), "Content-Length: %zu\r\n", resp->body_len);
+    if (len + cl_len >= buf_size) return 0;
+    memcpy(buf + len, cl_header, cl_len);
+    len += cl_len;
+
+    if (len + 2 >= buf_size) return 0;
+    memcpy(buf + len, "\r\n", 2);
+    len += 2;
+
+    if (resp->body_len > 0) {
+        if (len + resp->body_len >= buf_size) return 0;
+        memcpy(buf + len, resp->body, resp->body_len);
+        len += resp->body_len;
+    }
+
+    return len;
+}
+
+#endif // HTTP_PARSER_H
+
