@@ -7,10 +7,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
 #include "stringbuf.h"
 #ifndef INCLUDE_STB_DS_H
 #  include "stb_ds.h"
 #endif
+
+#define MAX_HEADERS 128
+#define MAX_BODY_SIZE (1 << 20)  // 1MB
+#define MAX_CHUNK_SIZE (1 << 16) // 64KB
+#define MAX_URL_SIZE 4096
+#define MAX_METHOD_SIZE 16
+#define MAX_HTTP_VERSION_SIZE 8
+#define MAX_HEADER_NAME_SIZE 256
+#define MAX_HEADER_VALUE_SIZE 4096
+#define MAX_HEADER_LINE_SIZE 8192
 
 struct http_header {
     char *key;
@@ -90,6 +101,10 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
                 if (line_end_pos == -1) return 0; // Need more data
 
                 size_t line_len = line_end_pos - parser->pos;
+                if (line_len > MAX_HEADER_LINE_SIZE) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
                 const char *line_start = buf + parser->pos;
                 if (line_end_pos > 0 && buf[line_end_pos - 1] == '\r') line_len--;
 
@@ -98,16 +113,43 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
                     parser->state = HP_ERROR;
                     return -1;
                 }
-                parser->req.method = strndup(line_start, space1_pos - parser->pos);
+                size_t method_len = space1_pos - parser->pos;
+                if (method_len == 0 || method_len > MAX_METHOD_SIZE) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
+                parser->req.method = strndup(line_start, method_len);
+                if (!parser->req.method) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
 
                 ssize_t space2_pos = stringbuf_find(&parser->buffer, space1_pos + 1, " ", 1);
                 if (space2_pos == -1) {
                     parser->state = HP_ERROR;
                     return -1;
                 }
-                parser->req.uri = strndup(buf + space1_pos + 1, space2_pos - (space1_pos + 1));
+                size_t uri_len = space2_pos - (space1_pos + 1);
+                if (uri_len == 0 || uri_len > MAX_URL_SIZE) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
+                parser->req.uri = strndup(buf + space1_pos + 1, uri_len);
+                if (!parser->req.uri) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
 
-                parser->req.version = strndup(buf + space2_pos + 1, line_end_pos - (space2_pos + 1));
+                size_t version_len = line_len - (space2_pos - parser->pos + 1);
+                if (version_len == 0 || version_len > MAX_HTTP_VERSION_SIZE) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
+                parser->req.version = strndup(buf + space2_pos + 1, version_len);
+                if (!parser->req.version) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
 
                 parser->pos = line_end_pos + 1;
                 parser->state = HP_HEADERS;
@@ -118,6 +160,10 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
                 if (line_end_pos == -1) return 0; // Need more data
 
                 size_t line_len = line_end_pos - parser->pos;
+                if (line_len > MAX_HEADER_LINE_SIZE) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
                 const char *line_start = buf + parser->pos;
                 if (line_end_pos > 0 && buf[line_end_pos - 1] == '\r') line_len--;
 
@@ -127,7 +173,14 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
 
                     ptrdiff_t cl_idx = shgeti(parser->req.headers, "Content-Length");
                     if (cl_idx >= 0) {
-                        parser->content_length = (size_t)strtoul(parser->req.headers[cl_idx].value, NULL, 10);
+                        char *endptr;
+                        errno = 0;
+                        unsigned long long cl = strtoull(parser->req.headers[cl_idx].value, &endptr, 10);
+                        if (errno == ERANGE || *endptr != '\0' || cl > MAX_BODY_SIZE) {
+                            parser->state = HP_ERROR;
+                            return -1;
+                        }
+                        parser->content_length = (size_t)cl;
                         parser->chunked = false;
                     } else {
                         ptrdiff_t te_idx = shgeti(parser->req.headers, "Transfer-Encoding");
@@ -163,11 +216,36 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
                 while (value_start < value_end && isspace((unsigned char)buf[value_start])) ++value_start;
                 while (value_end > value_start && isspace((unsigned char)buf[value_end - 1])) --value_end;
 
-                char *key = strndup(buf + name_start, name_end - name_start);
-                char *value = strndup(buf + value_start, value_end - value_start);
+                size_t name_len = name_end - name_start;
+                if (name_len == 0 || name_len > MAX_HEADER_NAME_SIZE) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
+                char *key = strndup(buf + name_start, name_len);
+                if (!key) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
+
+                size_t value_len = value_end - value_start;
+                if (value_len > MAX_HEADER_VALUE_SIZE) {
+                    free(key);
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
+                char *value = strndup(buf + value_start, value_len);
+                if (!value) {
+                    free(key);
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
 
                 struct http_header h = {.key = key, .value = value};
                 shputs(parser->req.headers, h);
+                if (shlen(parser->req.headers) > MAX_HEADERS) {
+                    parser->state = HP_ERROR;
+                    return -1;
+                }
 
                 parser->pos = line_end_pos + 1;
                 break;
@@ -179,7 +257,16 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
                     if (avail == 0) return 0;
 
                     size_t consume = (remaining < avail) ? remaining : avail;
-                    parser->req.body = (char *)realloc(parser->req.body, parser->req.body_len + consume);
+                    if (parser->req.body_len + consume > MAX_BODY_SIZE) {
+                        parser->state = HP_ERROR;
+                        return -1;
+                    }
+                    char *new_body = (char *)realloc(parser->req.body, parser->req.body_len + consume);
+                    if (!new_body) {
+                        parser->state = HP_ERROR;
+                        return -1;
+                    }
+                    parser->req.body = new_body;
                     memcpy(parser->req.body + parser->req.body_len, buf + parser->pos, consume);
                     parser->req.body_len += consume;
                     parser->pos += consume;
@@ -208,7 +295,15 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
                             char *semi = strchr(line, ';');
                             if (semi) *semi = '\0';
 
-                            parser->content_length = (size_t)strtoul(line, NULL, 16);
+                            char *endptr;
+                            errno = 0;
+                            unsigned long long chunk_size = strtoull(line, &endptr, 16);
+                            if (errno == ERANGE || *endptr != '\0' || chunk_size > MAX_CHUNK_SIZE || parser->req.body_len + chunk_size > MAX_BODY_SIZE) {
+                                parser->state = HP_ERROR;
+                                return -1;
+                            }
+                            parser->content_length = (size_t)chunk_size;
+
                             if (parser->content_length == 0) {
                                 parser->state = HP_DONE;
                                 parser->pos = line_end_pos + 1;
@@ -224,7 +319,12 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
                                 return -1;
                             }
 
-                            parser->req.body = (char *)realloc(parser->req.body, parser->req.body_len + parser->content_length);
+                            char *new_body = (char *)realloc(parser->req.body, parser->req.body_len + parser->content_length);
+                            if (!new_body) {
+                                parser->state = HP_ERROR;
+                                return -1;
+                            }
+                            parser->req.body = new_body;
                             memcpy(parser->req.body + parser->req.body_len, buf + parser->pos, parser->content_length);
                             parser->req.body_len += parser->content_length;
                             parser->pos += parser->content_length + 2;
@@ -274,7 +374,7 @@ static inline size_t http_build_response(const struct http_response *resp, char 
     memcpy(buf + len, "\r\n", 2);
     len += 2;
 
-    if (resp->body_len > 0) {
+    if (resp->body_len > 0 && resp->body) {
         if (len + resp->body_len >= buf_size) return 0;
         memcpy(buf + len, resp->body, resp->body_len);
         len += resp->body_len;
