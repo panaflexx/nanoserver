@@ -34,7 +34,7 @@
 
 #define NUM_CLIENTS 10000
 #define MAX_EVENTS 32
-#define MAX_MSG_SIZE 4096  // Increased for larger TLS records
+#define MAX_MSG_SIZE 4096
 #define EV_READ 1
 #define MAX_FDS 2
 #define MAX_SOCKETS 10
@@ -43,8 +43,6 @@ struct event {
     int fd;
     int events;
 };
-
-typedef void (*data_handler_t)(int fd, const char *msg);
 
 enum conn_type {
     CONN_UNKNOWN,
@@ -66,7 +64,7 @@ struct client_info {
 
 struct client_data {
     int fd;
-    data_handler_t on_data;
+    void (*on_data)();
     bool is_listen;
     size_t bytes_read;
     size_t bytes_written;
@@ -80,6 +78,8 @@ struct client_data {
     bool is_http;
     struct http_parser parser;
     bool handshake_done;
+    char *listen_uri;
+    struct socket_info *si;
 } clients[NUM_CLIENTS];
 
 struct fd_hash_entry {
@@ -95,12 +95,19 @@ struct socket_info {
     bool is_datagram;
     bool is_tls;
     bool is_http;
+    char *uri;
+
+    void (*socket_handler)();
 };
 
 struct server_sockets {
     struct socket_info sockets[MAX_SOCKETS];
     int num_sockets;
 };
+
+typedef void (*socket_handler_t)(int fd, const char *data, size_t len, struct client_info *info);
+typedef void (*http_handler_t)(int fd, struct http_request *req, struct client_data *info);
+static void default_http_handler(int fd, struct http_request *req, struct client_data *info);
 
 struct event_handlers {
     void (*on_accept)(int loopfd, int local_s);
@@ -110,6 +117,7 @@ struct event_handlers {
     void (*on_error)(int loopfd, int fd, int err);
     void (*on_access_log)(struct client_info *info, const char *action, size_t bytes_read, size_t bytes_written);
     void (*on_error_log)(const char *msg);
+    http_handler_t on_http_request;
 };
 
 static inline void my_on_error(int loopfd, int fd, int err, struct event_handlers *handlers);
@@ -146,7 +154,6 @@ static inline void socket_server_init_tls(const char *cert_pem, const char *key_
         return;
     }
 
-    // Enable TLS 1.2 and 1.3 explicitly
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
@@ -188,6 +195,8 @@ static inline int conn_add(int fd, bool is_listen) {
     clients[i].is_http = false;
     memset(&clients[i].parser, 0, sizeof(clients[i].parser));
     clients[i].handshake_done = true;
+    clients[i].listen_uri = NULL;
+    clients[i].si = NULL;
     hmput(fd_to_index, fd, i);
     return 0;
 }
@@ -206,6 +215,7 @@ static inline int conn_del(int fd) {
     if (clients[i].is_http) {
         http_parser_destroy(&clients[i].parser);
     }
+    free(clients[i].listen_uri);
     clients[i].fd = 0;
     clients[i].on_data = NULL;
     clients[i].is_listen = false;
@@ -215,32 +225,17 @@ static inline int conn_del(int fd) {
 
 static inline int socket_write(int fd, const void *buf, size_t len);
 
-static inline void send_welcome_tcp(int fd) {
-    int client_num = get_conn(fd);
-    char body[128];
-    sprintf(body, "welcome! you are client #%d!\r\n\r\n", client_num);
-    int body_len = strlen(body);
-    char response[512];
-    sprintf(response, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", body_len, body);
-    socket_write(fd, response, strlen(response));
-}
+static inline void default_socket_handler(int fd, const char *data, size_t len, struct client_info *info);
 
-static inline void send_welcome_udp(int fd, const char *msg) {
-    char reply[512];
-    int reply_len = snprintf(reply, sizeof(reply), "You wrote: %s\r\n", msg);
-    socket_write(fd, reply, reply_len);
-}
-
-static inline void default_data_handler(int fd, const char *msg) {
-    int idx = get_conn(fd);
-    if (idx == -1) return;
-    if (clients[idx].is_listen) {
-        send_welcome_udp(fd, msg);
+/*static inline void default_socket_handler(int fd, const char *data, size_t len, struct client_info *info) {
+    if (info->type == CONN_UDPV4 || info->type == CONN_UDPV6) {
+        socket_write(fd, data, len);
     } else {
-        send_welcome_tcp(fd);
+        const char *msg = "Hello world!\n";
+        socket_write(fd, msg, strlen(msg));
     }
-    fflush(stdout);
 }
+*/
 
 static inline int socket_write(int fd, const void *buf, size_t len) {
     int idx = get_conn(fd);
@@ -449,6 +444,8 @@ static inline void my_on_accept(int loopfd, int local_s, struct server_sockets *
         if (clients[idx].is_http) {
             http_parser_init(&clients[idx].parser);
         }
+        clients[idx].listen_uri = (si->uri==NULL) ? NULL : strdup(si->uri);
+        clients[idx].si = si;
     }
 #ifdef HAVE_OPENSSL
     if (si && si->is_tls && g_ssl_ctx) {
@@ -545,34 +542,13 @@ static inline void my_on_read(int loopfd, int fd, struct event_handlers *handler
             if (handlers->on_error_log) handlers->on_error_log("HTTP parse error");
             conn_del(fd);
         } else if (res > 0) {
-            struct http_request *req = &cd->parser.req;
-            char body[512];
-            snprintf(body, sizeof(body), "Welcome! Received request:\nMethod: %s\nURI: %s\nVersion: %s\nBody length: %zu\n",
-                     req->method ? req->method : "", req->uri ? req->uri : "", req->version ? req->version : "", req->body_len);
-            struct http_response resp;
-            memset(&resp, 0, sizeof(resp));
-            resp.status_code = 200;
-            resp.reason_phrase = "OK";
-            struct http_header ct = {.key = "Content-Type", .value = "text/plain"};
-            shputs(resp.headers, ct);
-            resp.body = body;
-            resp.body_len = strlen(body);
-            char resp_buf[2048];
-            size_t resp_len = http_build_response(&resp, resp_buf, sizeof(resp_buf));
-            if (resp_len > 0) {
-                ssize_t sent = socket_write(fd, resp_buf, resp_len);
-                if (sent > 0) {
-                    cd->bytes_written += sent;
-                }
-            }
-            shfree(resp.headers);
-            char action[512];
-            snprintf(action, sizeof(action), "%s %s %s", req->method ? req->method : "", req->uri ? req->uri : "", req->version ? req->version : "");
-            if (handlers->on_access_log) {
-                handlers->on_access_log(&cd->info, action, cd->bytes_read, cd->bytes_written);
+            if (handlers->on_http_request) {
+                handlers->on_http_request(fd, &cd->parser.req, cd);
+            } else {
+                default_http_handler(fd, &cd->parser.req, cd);
             }
             http_parser_reset(&cd->parser);
-            conn_del(fd);  // Close after response
+            conn_del(fd);
         }
     } else {
         if (cd->is_listen) {
@@ -580,7 +556,6 @@ static inline void my_on_read(int loopfd, int fd, struct event_handlers *handler
             socklen_t peer_len = sizeof(peer_addr);
             n = recvfrom(fd, buf, MAX_MSG_SIZE, 0, (struct sockaddr *)&peer_addr, &peer_len);
             if (n <= 0) return;
-            buf[n] = '\0';
             cd->bytes_read += n;
             if (!cd->connected) {
                 memcpy(&cd->peer_addr, &peer_addr, sizeof(peer_addr));
@@ -589,7 +564,11 @@ static inline void my_on_read(int loopfd, int fd, struct event_handlers *handler
                 cd->connected = true;
                 if (handlers->on_connect) handlers->on_connect(loopfd, fd, &cd->info);
             }
-            if (cd->on_data) cd->on_data(fd, buf);
+            if (cd->si->socket_handler) {
+                cd->si->socket_handler(fd, buf, n, &cd->info);
+            } else {
+                default_socket_handler(fd, buf, n, &cd->info);
+            }
         } else {
 #ifdef HAVE_OPENSSL
             if (cd->ssl) {
@@ -618,9 +597,12 @@ static inline void my_on_read(int loopfd, int fd, struct event_handlers *handler
                     return;
                 }
             }
-            buf[n] = '\0';
             cd->bytes_read += n;
-            if (cd->on_data) cd->on_data(fd, buf);
+            if (cd->si->socket_handler) {
+                cd->si->socket_handler(fd, buf, n, &cd->info);
+            } else {
+                default_socket_handler(fd, buf, n, &cd->info);
+            }
         }
     }
 }
@@ -806,7 +788,16 @@ static inline struct socket_info create_socket_and_listen(const char *uri, int b
         }
         si.fds[si.num_fds++] = local_s;
     } else {
-        char *host_ptr = strlen(host) > 0 ? host : NULL;
+        char *host_ptr = NULL;
+		if (strlen(host) > 0) {
+            host_ptr = host;
+            // Strip brackets if present (for IPv6 literals like [::])
+            if (host[0] == '[' && host[strlen(host)-1] == ']') {
+                host[strlen(host)-1] = '\0';  // Temporarily null-terminate
+                host_ptr = host + 1;         // Point inside brackets
+            }
+        }
+
         struct addrinfo hints = {0};
         hints.ai_flags = AI_PASSIVE;
         hints.ai_family = PF_UNSPEC;
@@ -920,6 +911,7 @@ static inline void socket_server_init_event_handlers(struct event_handlers *hand
     handlers->on_error = default_on_error;
     handlers->on_access_log = NULL;
     handlers->on_error_log = NULL;
+    handlers->on_http_request = NULL;
 }
 
 static inline int socket_server_add_sockets(struct server_sockets *ss, const char **uris, int num_uris, int default_backlog) {
@@ -958,10 +950,6 @@ static inline int socket_server_setup_loop(int loopfd, struct server_sockets *ss
                 if (conn_add(ls, true) < 0) {
                     fprintf(stderr, "Failed to add datagram socket\n");
                     return -1;
-                }
-                int idx = get_conn(ls);
-                if (idx != -1) {
-                    clients[idx].on_data = default_data_handler;
                 }
             }
         }
