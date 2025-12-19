@@ -3,14 +3,13 @@
 Start a web server on port 80, serve ./public folder
 .. code-block:: bash
 
-   $ ./server http://:80
+    $ ./server http://:80
 
 Create test certs, start an HTTPS server on ./public folder
 .. code-block:: bash
 
-   $ sh make_test_cert.sh
-   
-   $ sudo ./server https://:443 http://:80 -cert testsite.crt -key testsite.key
+    $ sh make_test_cert.sh
+    $ sudo ./server https://:443 http://:80 -cert testsite.crt -key testsite.key
 
 ## WHY?
   Because I wanted a small, high-performance, C only mantlepiece
