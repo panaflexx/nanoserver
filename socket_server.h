@@ -636,7 +636,7 @@ static inline void my_on_read(int loopfd, int fd, struct event_handlers *handler
                 cd->connected = true;
                 if (handlers->on_connect) handlers->on_connect(loopfd, fd, &cd->info);
             }
-            if (cd->si->socket_handler) {
+            if (cd->si && cd->si->socket_handler) {
                 cd->si->socket_handler(fd, buf, n, &cd->info);
             } else {
                 default_socket_handler(fd, buf, n, &cd->info);
