@@ -1,14 +1,10 @@
-## Basic Usage
+## Basic Usage ##
 
 Start a web server on port 80, serve ./public folder
-
-.. code-block:: bash
 
     $ ./server http://:80
 
 Create test certs, start an HTTPS server on ./public folder
-
-.. code-block:: bash
 
     $ sh make_test_cert.sh
     $ sudo ./server https://:443 http://:80 -cert testsite.crt -key testsite.key
@@ -17,13 +13,16 @@ Create test certs, start an HTTPS server on ./public folder
   Because I wanted a small, high-performance, C only mantlepiece
 
 ## Technical Details
-  1. The nanoserver uses modern event socket handling (kevent, epoll) and can handle tcp, udp, local (unix) sockets and SSL/TLS.
-  2. http header-only parsing lib
-  3. socket header-only lib
-  4. stringbuf header-only lib for secure buffers
-  5. It's all in a single process
-  6. You can write handlers in c
-  7. All in one server.c
+  1. The nanoserver uses modern event socket handling (kevent, epoll)
+  2. Can handle
+     - tcp, udp, local (unix) sockets
+     - SSL/TLS.
+  4. http header-only parsing lib
+  5. socket header-only lib
+  6. stringbuf header-only lib for secure buffers
+  7. It's all in a single process
+  8. You can write handlers in c
+  9. All in one server.c
 
 ## Problems
 1. It's got a memory leak - shows up during wrk testing
