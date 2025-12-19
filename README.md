@@ -9,6 +9,7 @@ Create test certs, start an HTTPS server on ./public folder
 .. code-block:: bash
 
    $ sh make_test_cert.sh
+   
    $ sudo ./server https://:443 http://:80 -cert testsite.crt -key testsite.key
 
 ## WHY?
