@@ -1,11 +1,13 @@
 ## Basic Usage
 
 Start a web server on port 80, serve ./public folder
+
 .. code-block:: bash
 
     $ ./server http://:80
 
 Create test certs, start an HTTPS server on ./public folder
+
 .. code-block:: bash
 
     $ sh make_test_cert.sh
