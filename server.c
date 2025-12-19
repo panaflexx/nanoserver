@@ -3,13 +3,15 @@
 #include <signal.h>
 #include "socket_server.h"
 #include "request.h"
+#include <sys/resource.h>
 
 struct base_entry *base_handlers = NULL;
 struct path_entry *global_http_handlers = NULL;
 struct socket_handler_entry *socket_handler_map = NULL;
+LocationEntry *locations = NULL;
 
 int main(int argc, char *argv[]) {
-    signal(SIGPIPE, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN); // Ignoring SIGPIPE
     char *cert_file = NULL;
     char *key_file = NULL;
     int i = 1;
@@ -94,6 +96,17 @@ int main(int argc, char *argv[]) {
 
     socket_server_init_hash();
 
+	// Increase open file descriptor limit to handle more connections
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        rl.rlim_cur = rl.rlim_max = 10000;  // Set to a high value (adjust as needed)
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+            fprintf(stderr, "Warning: Failed to set rlimit: %s\n", strerror(errno));
+        }
+    } else {
+        fprintf(stderr, "Warning: Failed to get rlimit: %s\n", strerror(errno));
+    }
+
     int loopfd = event_create();
     if (loopfd < 0) {
         log_sys_error(NULL, "event_create", errno);
@@ -121,6 +134,8 @@ int main(int argc, char *argv[]) {
     handlers.on_error_log = default_error_log;
     handlers.on_http_request = http_dispatcher;
 
+    addLocation("/", "html", 1001, 1001);
+    addHandler("/", directory_handler);
     addHandler("/hello", hello_http_handler);
 
     run_event_loop(loopfd, &ss, &handlers);

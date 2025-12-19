@@ -45,6 +45,11 @@ struct http_response {
     size_t body_len;
 };
 
+struct http_response_log {
+    int status_code;
+	size_t br, bw;
+};
+
 enum http_parser_state {
     HP_REQUEST_LINE,
     HP_HEADERS,
@@ -53,19 +58,22 @@ enum http_parser_state {
     HP_ERROR
 };
 
-struct http_parser {
+typedef struct http_parser {
     enum http_parser_state state;
     StringBuf buffer;
     size_t pos;
     struct http_request req;
     size_t content_length;
     bool chunked;
-};
+	int fd; // for sockets
+} http_p;
 
-static inline void http_parser_init(struct http_parser *parser) {
+
+static inline void http_parser_init(struct http_parser *parser, int fd) {
     memset(parser, 0, sizeof(*parser));
     parser->state = HP_REQUEST_LINE;
     stringbuf_init(&parser->buffer, 0);
+	parser->fd = fd;
 }
 
 static inline void http_parser_reset(struct http_parser *parser) {
@@ -75,7 +83,7 @@ static inline void http_parser_reset(struct http_parser *parser) {
     free(parser->req.version);
     free(parser->req.body);
     stringbuf_free(&parser->buffer);
-    http_parser_init(parser);
+    http_parser_init(parser, parser->fd);
 }
 
 static inline void http_parser_destroy(struct http_parser *parser) {
@@ -140,7 +148,7 @@ static inline int http_parser_feed(struct http_parser *parser, const char *data,
                     return -1;
                 }
 
-                size_t version_len = line_len - (space2_pos - parser->pos + 1);
+                size_t version_len = (parser->pos + line_len) - (space2_pos + 1);
                 if (version_len == 0 || version_len > MAX_HTTP_VERSION_SIZE) {
                     parser->state = HP_ERROR;
                     return -1;
@@ -381,6 +389,13 @@ static inline size_t http_build_response(const struct http_response *resp, char 
     }
 
     return len;
+}
+
+static inline bool http_should_keep_alive(struct http_request *req) {
+    if (req->version && strcmp(req->version, "HTTP/1.1") != 0) return false;
+    ptrdiff_t conn_idx = shgeti(req->headers, "Connection");
+    if (conn_idx >= 0 && strcasecmp(req->headers[conn_idx].value, "close") == 0) return false;
+    return true;
 }
 
 #endif // HTTP_PARSER_H

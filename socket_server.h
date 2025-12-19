@@ -20,6 +20,7 @@
 #include <sys/epoll.h>
 #else
 #include <sys/event.h>
+#include <sys/uio.h>
 #endif
 
 #define STB_DS_IMPLEMENTATION
@@ -36,8 +37,10 @@
 #define MAX_EVENTS 32
 #define MAX_MSG_SIZE 4096
 #define EV_READ 1
+#define EV_WRITE 2
 #define MAX_FDS 2
 #define MAX_SOCKETS 10
+#define CHUNK_SIZE 65536
 
 struct event {
     int fd;
@@ -80,6 +83,17 @@ struct client_data {
     bool handshake_done;
     char *listen_uri;
     struct socket_info *si;
+	char *matched_prefix;
+	// file sending
+	bool sending_body;
+    int send_file_fd;
+    off_t send_offset;
+    size_t send_remaining;
+    bool use_sendfile;
+    char *send_buffer;
+    size_t send_buf_len;
+    size_t send_buf_pos;
+    int loopfd;
 } clients[NUM_CLIENTS];
 
 struct fd_hash_entry {
@@ -105,9 +119,11 @@ struct server_sockets {
     int num_sockets;
 };
 
+struct http_parser;
+
 typedef void (*socket_handler_t)(int fd, const char *data, size_t len, struct client_info *info);
-typedef void (*http_handler_t)(int fd, struct http_request *req, struct client_data *info);
-static void default_http_handler(int fd, struct http_request *req, struct client_data *info);
+typedef void (*http_handler_t)(struct http_parser *http, struct http_request *req, struct client_data *info);
+static void default_http_handler(struct http_parser *http, struct http_request *req, struct client_data *info);
 
 struct event_handlers {
     void (*on_accept)(int loopfd, int local_s);
@@ -121,6 +137,23 @@ struct event_handlers {
 };
 
 static inline void my_on_error(int loopfd, int fd, int err, struct event_handlers *handlers);
+static inline int event_mod(int loopfd, int fd, int events);
+
+static inline void cleanup_send_state(struct client_data *cd) {
+    if (cd->send_file_fd >= 0) {
+        close(cd->send_file_fd);
+        cd->send_file_fd = -1;
+    }
+    if (cd->send_buffer) {
+        free(cd->send_buffer);
+        cd->send_buffer = NULL;
+    }
+    cd->send_offset = 0;
+    cd->send_remaining = 0;
+    cd->send_buf_len = 0;
+    cd->send_buf_pos = 0;
+    cd->sending_body = false;
+}
 
 #ifdef HAVE_OPENSSL
 static SSL_CTX *g_ssl_ctx = NULL;
@@ -171,7 +204,7 @@ static inline int get_conn(int fd) {
     return idx;
 }
 
-static inline int conn_add(int fd, bool is_listen) {
+static inline int conn_add(int loopfd, int fd, bool is_listen) {
     if (fd < 1) return -1;
     int i;
     for (i = 0; i < NUM_CLIENTS; i++) {
@@ -192,6 +225,17 @@ static inline int conn_add(int fd, bool is_listen) {
 #ifdef HAVE_OPENSSL
     clients[i].ssl = NULL;
 #endif
+	// File sending state
+	clients[i].sending_body = false;
+    clients[i].send_file_fd = -1;
+    clients[i].send_offset = 0;
+    clients[i].send_remaining = 0;
+    clients[i].use_sendfile = false;
+    clients[i].send_buffer = NULL;
+    clients[i].send_buf_len = 0;
+    clients[i].send_buf_pos = 0;
+    clients[i].loopfd = loopfd;
+
     clients[i].is_http = false;
     memset(&clients[i].parser, 0, sizeof(clients[i].parser));
     clients[i].handshake_done = true;
@@ -215,6 +259,7 @@ static inline int conn_del(int fd) {
     if (clients[i].is_http) {
         http_parser_destroy(&clients[i].parser);
     }
+	cleanup_send_state(&clients[i]);
     free(clients[i].listen_uri);
     clients[i].fd = 0;
     clients[i].on_data = NULL;
@@ -269,30 +314,33 @@ static inline int socket_write(int fd, const void *buf, size_t len) {
     return -1;
 }
 
-#ifdef __linux__
+#ifdef linux
 static inline int event_create(void) {
-    return epoll_create1(EPOLL_CLOEXEC);
+	return epoll_create1(EPOLL_CLOEXEC);
 }
-
 static inline int event_add(int loopfd, int fd, int events, void *udata) {
-    struct epoll_event ev;
-    ev.events = (events & EV_READ) ? EPOLLIN : 0;
-    ev.data.fd = fd;
-    return epoll_ctl(loopfd, EPOLL_CTL_ADD, fd, &ev);
+	struct epoll_event ev;
+	ev.events = ((events & EV_READ) ? EPOLLIN : 0) | ((events & EV_WRITE) ? EPOLLOUT : 0);
+	ev.data.fd = fd;
+	return epoll_ctl(loopfd, EPOLL_CTL_ADD, fd, &ev);
 }
-
 static inline int event_del(int loopfd, int fd, int events, void *udata) {
-    return epoll_ctl(loopfd, EPOLL_CTL_DEL, fd, NULL);
+	return epoll_ctl(loopfd, EPOLL_CTL_DEL, fd, NULL);
 }
-
 static inline int event_wait(int loopfd, struct event *evlist, int max, int timeout_ms) {
-    struct epoll_event native_events[max];
-    int n = epoll_wait(loopfd, native_events, max, timeout_ms);
-    for (int j = 0; j < n; j++) {
-        evlist[j].fd = native_events[j].data.fd;
-        evlist[j].events = (native_events[j].events & EPOLLIN) ? EV_READ : 0;
-    }
-    return n;
+	struct epoll_event native_events[max];
+	int n = epoll_wait(loopfd, native_events, max, timeout_ms);
+	for (int j = 0; j < n; j++) {
+		evlist[j].fd = native_events[j].data.fd;
+		evlist[j].events = 0;
+		if (native_events[j].events & EPOLLIN) {
+			evlist[j].events |= EV_READ;
+		}
+		if (native_events[j].events & EPOLLOUT) {
+			evlist[j].events |= EV_WRITE;
+		}
+	}
+	return n;
 }
 #else
 static inline int event_create(void) {
@@ -300,15 +348,27 @@ static inline int event_create(void) {
 }
 
 static inline int event_add(int loopfd, int fd, int events, void *udata) {
-    struct kevent ev;
-    EV_SET(&ev, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
-    return kevent(loopfd, &ev, 1, NULL, 0, NULL);
+    struct kevent ev[2];
+    int nev = 0;
+    if (events & EV_READ) {
+        EV_SET(&ev[nev++], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    }
+    if (events & EV_WRITE) {
+        EV_SET(&ev[nev++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    }
+    return kevent(loopfd, ev, nev, NULL, 0, NULL);
 }
 
 static inline int event_del(int loopfd, int fd, int events, void *udata) {
-    struct kevent ev;
-    EV_SET(&ev, fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-    return kevent(loopfd, &ev, 1, NULL, 0, NULL);
+    struct kevent ev[2];
+    int nev = 0;
+    if (events & EV_READ) {
+        EV_SET(&ev[nev++], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    }
+    if (events & EV_WRITE) {
+        EV_SET(&ev[nev++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+    }
+    return kevent(loopfd, ev, nev, NULL, 0, NULL);
 }
 
 static inline int event_wait(int loopfd, struct event *evlist, int max, int timeout_ms) {
@@ -320,11 +380,19 @@ static inline int event_wait(int loopfd, struct event *evlist, int max, int time
         t.tv_nsec = (timeout_ms % 1000) * 1000000LL;
         ts = &t;
     }
+	
     int n = kevent(loopfd, NULL, 0, native_events, max, ts);
-    for (int j = 0; j < n; j++) {
+	for (int j = 0; j < n; j++) {
         evlist[j].fd = native_events[j].ident;
-        evlist[j].events = (native_events[j].filter == EVFILT_READ) ? EV_READ : 0;
+        evlist[j].events = 0;
+        if (native_events[j].filter == EVFILT_READ) {
+            evlist[j].events |= EV_READ;
+        }
+        if (native_events[j].filter == EVFILT_WRITE) {
+            evlist[j].events |= EV_WRITE;
+        }
     }
+    
     return n;
 }
 #endif
@@ -414,6 +482,85 @@ static inline struct socket_info *get_socket_info(struct server_sockets *ss, int
     return NULL;
 }
 
+static inline void resume_send(struct client_data *cd) {
+    if (!cd->sending_body || cd->send_remaining == 0) return;
+    //printf("resume_send: sendfile=%s remaining=%zu    \r", cd->use_sendfile ? "TRUE" : "FALSE", cd->send_remaining);
+
+    ssize_t sent = 0;
+    if (cd->use_sendfile) {
+#ifdef __APPLE__
+        off_t len = cd->send_remaining;
+        int ret = sendfile(cd->send_file_fd, cd->fd, cd->send_offset, &len, NULL, 0);
+        sent = len;
+        if (ret == -1) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                conn_del(cd->fd);
+                return;
+            }
+            // For EAGAIN, proceed with sent = len (possibly 0 or partial)
+        }
+        // For success (ret == 0), sent = len == remaining
+#else
+        sent = sendfile(cd->fd, cd->send_file_fd, &cd->send_offset, cd->send_remaining);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                sent = 0;
+                // Proceed
+            } else {
+                my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                conn_del(cd->fd);
+                return;
+            }
+        }
+#endif
+    } else {
+        if (cd->send_buf_pos == cd->send_buf_len) {
+            ssize_t r = read(cd->send_file_fd, cd->send_buffer, CHUNK_SIZE);
+            if (r <= 0) {
+                if (r < 0) my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                return;
+            }
+            cd->send_buf_len = r;
+            cd->send_buf_pos = 0;
+            //printf("Buffered read: %zd bytes\n", r);
+        }
+        sent = socket_write(cd->fd, cd->send_buffer + cd->send_buf_pos, cd->send_buf_len - cd->send_buf_pos);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                sent = 0;
+            } else {
+                my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                conn_del(cd->fd);
+                return;
+            }
+        }
+        cd->send_buf_pos += sent;
+        //printf("Buffered sent: %zd bytes\n", sent);
+    }
+    cd->bytes_written += sent;
+    cd->send_remaining -= sent;
+    cd->send_offset += sent;
+    //printf("sent %zd, remaining now %zu\n", sent, cd->send_remaining);
+    if (cd->send_remaining == 0) {
+        cleanup_send_state(cd);
+        event_mod(cd->loopfd, cd->fd, EV_READ);
+        if (http_should_keep_alive(&cd->parser.req)) {
+			//printf("http_parser_reset\n");
+            http_parser_reset(&cd->parser);
+        } else {
+			//printf("conn_del\n");
+            conn_del(cd->fd);
+        }
+    } else {
+        event_mod(cd->loopfd, cd->fd, EV_WRITE);
+    }
+}
+
 static inline void my_on_accept(int loopfd, int local_s, struct server_sockets *ss, struct event_handlers *handlers) {
     struct sockaddr_storage peer_addr;
     socklen_t peer_len = sizeof(peer_addr);
@@ -428,7 +575,7 @@ static inline void my_on_accept(int loopfd, int local_s, struct server_sockets *
         close(c);
         return;
     }
-    if (conn_add(c, false) < 0) {
+    if (conn_add(loopfd, c, false) < 0) {
         fprintf(stderr, "Too many clients\n");
         close(c);
         return;
@@ -442,7 +589,7 @@ static inline void my_on_accept(int loopfd, int local_s, struct server_sockets *
     if (si) {
         clients[idx].is_http = si->is_http;
         if (clients[idx].is_http) {
-            http_parser_init(&clients[idx].parser);
+            http_parser_init(&clients[idx].parser, c);
         }
         clients[idx].listen_uri = (si->uri==NULL) ? NULL : strdup(si->uri);
         clients[idx].si = si;
@@ -490,6 +637,7 @@ static inline void my_on_read(int loopfd, int fd, struct event_handlers *handler
     int idx = get_conn(fd);
     if (idx == -1) return;
     struct client_data *cd = &clients[idx];
+
 #ifdef HAVE_OPENSSL
     if (cd->ssl && !cd->handshake_done) {
         int ret = SSL_accept(cd->ssl);
@@ -543,12 +691,12 @@ static inline void my_on_read(int loopfd, int fd, struct event_handlers *handler
             conn_del(fd);
         } else if (res > 0) {
             if (handlers->on_http_request) {
-                handlers->on_http_request(fd, &cd->parser.req, cd);
+                handlers->on_http_request(&cd->parser, &cd->parser.req, cd);
             } else {
-                default_http_handler(fd, &cd->parser.req, cd);
+                default_http_handler(&cd->parser, &cd->parser.req, cd);
             }
-            http_parser_reset(&cd->parser);
-            conn_del(fd);
+            //http_parser_reset(&cd->parser);
+            //conn_del(fd);
         }
     } else {
         if (cd->is_listen) {
@@ -607,6 +755,15 @@ static inline void my_on_read(int loopfd, int fd, struct event_handlers *handler
     }
 }
 
+static inline void my_on_write(int loopfd, int fd) {
+    int idx = get_conn(fd);
+    if (idx == -1) return;
+    struct client_data *cd = &clients[idx];
+	if (cd->sending_body) {
+        resume_send(cd);
+    }
+}
+
 static inline void my_on_disconnect(int loopfd, int fd, struct event_handlers *handlers) {
     int idx = get_conn(fd);
     if (idx == -1) return;
@@ -621,13 +778,83 @@ static inline void my_on_disconnect(int loopfd, int fd, struct event_handlers *h
 }
 
 static inline void my_on_error(int loopfd, int fd, int err, struct event_handlers *handlers) {
-    if (handlers->on_error) handlers->on_error(loopfd, fd, err);
+    if (handlers && handlers->on_error)
+		handlers->on_error(loopfd, fd, err);
+	else
+		fprintf(stderr, "my_on_error: fd=%d err=%s\n", fd, strerror(err) );
+
 #ifdef HAVE_OPENSSL
     ERR_print_errors_fp(stderr);
 #endif
 }
 
+static inline int event_mod(int loopfd, int fd, int events) {
+#ifdef __linux__
+    struct epoll_event ev = {0};
+    ev.events = (events & EV_READ ? EPOLLIN : 0) | (events & EV_WRITE ? EPOLLOUT : 0);
+    ev.data.fd = fd;
+    return epoll_ctl(loopfd, EPOLL_CTL_MOD, fd, &ev);
+#else
+    struct kevent ev[2];
+    int nev = 0;
+    if (events & EV_READ) {
+        EV_SET(&ev[nev++], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    } else {
+        EV_SET(&ev[nev++], fd, EVFILT_READ, EV_ADD | EV_DISABLE, 0, 0, NULL);
+    }
+    if (events & EV_WRITE) {
+        EV_SET(&ev[nev++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    } else {
+        EV_SET(&ev[nev++], fd, EVFILT_WRITE, EV_ADD | EV_DISABLE, 0, 0, NULL);
+    }
+    return kevent(loopfd, ev, nev, NULL, 0, NULL);
+#endif
+}
+
 static inline void run_event_loop(int loopfd, struct server_sockets *ss, struct event_handlers *handlers) {
+    struct event evlist[MAX_EVENTS];
+    bool is_datagram = false;
+    while (1) {
+        int num = event_wait(loopfd, evlist, MAX_EVENTS, -1);
+        if (num < 0) {
+            log_sys_error(handlers, "event_wait", errno);
+            break;
+        }
+        for (int i = 0; i < num; ++i) {
+            int fd = evlist[i].fd;
+            bool is_listener_fd = false;
+            for (int k = 0; k < ss->num_sockets; k++) {
+                for (int j = 0; j < ss->sockets[k].num_fds; j++) {
+                    if (ss->sockets[k].fds[j] == fd) {
+                        is_listener_fd = true;
+                        is_datagram = ss->sockets[k].is_datagram;
+                        goto found_listener;
+                    }
+                }
+            }
+        found_listener:
+            if (is_listener_fd) {
+                if (is_datagram) {
+                    my_on_read(loopfd, fd, handlers);
+                } else {
+                    my_on_accept(loopfd, fd, ss, handlers);
+                }
+            } else {
+                int idx = get_conn(fd);
+                if (idx == -1) continue;  // Invalid fd
+                struct client_data *cd = &clients[idx];
+                if (evlist[i].events & EV_READ) {
+                    my_on_read(loopfd, fd, handlers);
+                }
+                if (evlist[i].events & EV_WRITE) {
+                    my_on_write(loopfd, fd);
+                }
+            }
+        }
+    }
+}
+
+static inline void run_event_loop_old(int loopfd, struct server_sockets *ss, struct event_handlers *handlers) {
     struct event evlist[MAX_EVENTS];
 	bool is_datagram = false;
 
@@ -947,7 +1174,7 @@ static inline int socket_server_setup_loop(int loopfd, struct server_sockets *ss
                 return -1;
             }
             if (ss->sockets[k].is_datagram) {
-                if (conn_add(ls, true) < 0) {
+                if (conn_add(loopfd, ls, true) < 0) {
                     fprintf(stderr, "Failed to add datagram socket\n");
                     return -1;
                 }
