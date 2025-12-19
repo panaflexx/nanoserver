@@ -21,7 +21,7 @@ target_link_libraries(server PRIVATE
 )
 
 # Add debug symbols (equivalent to -g3)
-target_compile_options(server PRIVATE -g3)
+target_compile_options(server PRIVATE -g3 -O3)
 
 # Define HAVE_OPENSSL preprocessor macro (equivalent to -DHAVE_OPENSSL)
 target_compile_definitions(server PRIVATE HAVE_OPENSSL)

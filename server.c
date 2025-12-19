@@ -133,6 +133,7 @@ int main(int argc, char *argv[]) {
     handlers.on_access_log = default_access_log;
     handlers.on_error_log = default_error_log;
     handlers.on_http_request = http_dispatcher;
+	handlers.on_write = resume_send;
 
     addLocation("/", "html", 1001, 1001);
     addHandler("/", directory_handler);

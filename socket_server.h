@@ -128,6 +128,7 @@ static void default_http_handler(struct http_parser *http, struct http_request *
 struct event_handlers {
     void (*on_accept)(int loopfd, int local_s);
     void (*on_read)(int loopfd, int fd);
+    void (*on_write)(int loopfd, int fd);
     void (*on_connect)(int loopfd, int fd, struct client_info *info);
     void (*on_disconnect)(int loopfd, int fd);
     void (*on_error)(int loopfd, int fd, int err);
@@ -482,84 +483,7 @@ static inline struct socket_info *get_socket_info(struct server_sockets *ss, int
     return NULL;
 }
 
-static inline void resume_send(struct client_data *cd) {
-    if (!cd->sending_body || cd->send_remaining == 0) return;
-    //printf("resume_send: sendfile=%s remaining=%zu    \r", cd->use_sendfile ? "TRUE" : "FALSE", cd->send_remaining);
 
-    ssize_t sent = 0;
-    if (cd->use_sendfile) {
-#ifdef __APPLE__
-        off_t len = cd->send_remaining;
-        int ret = sendfile(cd->send_file_fd, cd->fd, cd->send_offset, &len, NULL, 0);
-        sent = len;
-        if (ret == -1) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                my_on_error(cd->loopfd, cd->fd, errno, NULL);
-                cleanup_send_state(cd);
-                conn_del(cd->fd);
-                return;
-            }
-            // For EAGAIN, proceed with sent = len (possibly 0 or partial)
-        }
-        // For success (ret == 0), sent = len == remaining
-#else
-        sent = sendfile(cd->fd, cd->send_file_fd, &cd->send_offset, cd->send_remaining);
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                sent = 0;
-                // Proceed
-            } else {
-                my_on_error(cd->loopfd, cd->fd, errno, NULL);
-                cleanup_send_state(cd);
-                conn_del(cd->fd);
-                return;
-            }
-        }
-#endif
-    } else {
-        if (cd->send_buf_pos == cd->send_buf_len) {
-            ssize_t r = read(cd->send_file_fd, cd->send_buffer, CHUNK_SIZE);
-            if (r <= 0) {
-                if (r < 0) my_on_error(cd->loopfd, cd->fd, errno, NULL);
-                cleanup_send_state(cd);
-                return;
-            }
-            cd->send_buf_len = r;
-            cd->send_buf_pos = 0;
-            //printf("Buffered read: %zd bytes\n", r);
-        }
-        sent = socket_write(cd->fd, cd->send_buffer + cd->send_buf_pos, cd->send_buf_len - cd->send_buf_pos);
-        if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                sent = 0;
-            } else {
-                my_on_error(cd->loopfd, cd->fd, errno, NULL);
-                cleanup_send_state(cd);
-                conn_del(cd->fd);
-                return;
-            }
-        }
-        cd->send_buf_pos += sent;
-        //printf("Buffered sent: %zd bytes\n", sent);
-    }
-    cd->bytes_written += sent;
-    cd->send_remaining -= sent;
-    cd->send_offset += sent;
-    //printf("sent %zd, remaining now %zu\n", sent, cd->send_remaining);
-    if (cd->send_remaining == 0) {
-        cleanup_send_state(cd);
-        event_mod(cd->loopfd, cd->fd, EV_READ);
-        if (http_should_keep_alive(&cd->parser.req)) {
-			//printf("http_parser_reset\n");
-            http_parser_reset(&cd->parser);
-        } else {
-			//printf("conn_del\n");
-            conn_del(cd->fd);
-        }
-    } else {
-        event_mod(cd->loopfd, cd->fd, EV_WRITE);
-    }
-}
 
 static inline void my_on_accept(int loopfd, int local_s, struct server_sockets *ss, struct event_handlers *handlers) {
     struct sockaddr_storage peer_addr;
@@ -755,13 +679,13 @@ static inline void my_on_read(int loopfd, int fd, struct event_handlers *handler
     }
 }
 
-static inline void my_on_write(int loopfd, int fd) {
+static inline void my_on_write(int loopfd, int fd, struct event_handlers *handlers) {
     int idx = get_conn(fd);
     if (idx == -1) return;
     struct client_data *cd = &clients[idx];
-	if (cd->sending_body) {
-        resume_send(cd);
-    }
+	if(handlers && handlers->on_write) {
+        handlers->on_write(loopfd, fd);
+	}
 }
 
 static inline void my_on_disconnect(int loopfd, int fd, struct event_handlers *handlers) {
@@ -847,7 +771,7 @@ static inline void run_event_loop(int loopfd, struct server_sockets *ss, struct 
                     my_on_read(loopfd, fd, handlers);
                 }
                 if (evlist[i].events & EV_WRITE) {
-                    my_on_write(loopfd, fd);
+                    my_on_write(loopfd, fd, handlers);
                 }
             }
         }

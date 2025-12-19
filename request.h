@@ -52,6 +52,8 @@ extern struct socket_handler_entry *socket_handler_map;
 extern LocationEntry *locations;
 extern struct event_handlers handlers;
 
+static inline void resume_send(int loopfd, int fd);
+
 static inline void addLocation(const char *prefix, const char *real_path, uid_t user, gid_t group) {
     char *p = strdup(prefix);
     if (!p) return;
@@ -285,7 +287,7 @@ static inline void directory_handler(http_p *p, struct http_request *req, struct
     cd->send_buf_len = 0;
     cd->send_buf_pos = 0;
     // Initial attempt to send
-    resume_send(cd);
+    resume_send(cd->loopfd, cd->fd);
 	//printf("event_mod WAIT FOR WRITE\n");
 	//event_mod(cd->loopfd, p->fd, EV_WRITE);
 	/*
@@ -382,6 +384,89 @@ static inline void http_dispatcher(http_p *p, struct http_request *req, struct c
         conn_del(p->fd);
 		// FIXME: We don't have the loopfd... soooo maybe fix later
         //if (handlers.on_disconnect) handlers.on_disconnect(loopfd, fd);  // loopfd from outer scope
+    }
+}
+
+static inline void resume_send(int loopfd, int fd) {
+	int idx = get_conn(fd);
+    if (idx == -1) return;
+    struct client_data *cd = &clients[idx];
+
+    if (!cd->sending_body || cd->send_remaining == 0) return;
+    //printf("resume_send: sendfile=%s remaining=%zu    \r", cd->use_sendfile ? "TRUE" : "FALSE", cd->send_remaining);
+
+    ssize_t sent = 0;
+    if (cd->use_sendfile) {
+#ifdef __APPLE__
+        off_t len = cd->send_remaining;
+        int ret = sendfile(cd->send_file_fd, cd->fd, cd->send_offset, &len, NULL, 0);
+        sent = len;
+        if (ret == -1) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                conn_del(cd->fd);
+                return;
+            }
+            // For EAGAIN, proceed with sent = len (possibly 0 or partial)
+        }
+        // For success (ret == 0), sent = len == remaining
+#else
+        sent = sendfile(cd->fd, cd->send_file_fd, &cd->send_offset, cd->send_remaining);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                sent = 0;
+                // Proceed
+            } else {
+                my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                conn_del(cd->fd);
+                return;
+            }
+        }
+#endif
+    } else {
+        if (cd->send_buf_pos == cd->send_buf_len) {
+            ssize_t r = read(cd->send_file_fd, cd->send_buffer, CHUNK_SIZE);
+            if (r <= 0) {
+                if (r < 0) my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                return;
+            }
+            cd->send_buf_len = r;
+            cd->send_buf_pos = 0;
+            //printf("Buffered read: %zd bytes\n", r);
+        }
+        sent = socket_write(cd->fd, cd->send_buffer + cd->send_buf_pos, cd->send_buf_len - cd->send_buf_pos);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                sent = 0;
+            } else {
+                my_on_error(cd->loopfd, cd->fd, errno, NULL);
+                cleanup_send_state(cd);
+                conn_del(cd->fd);
+                return;
+            }
+        }
+        cd->send_buf_pos += sent;
+        //printf("Buffered sent: %zd bytes\n", sent);
+    }
+    cd->bytes_written += sent;
+    cd->send_remaining -= sent;
+    cd->send_offset += sent;
+    //printf("sent %zd, remaining now %zu\n", sent, cd->send_remaining);
+    if (cd->send_remaining == 0) {
+        cleanup_send_state(cd);
+        event_mod(cd->loopfd, cd->fd, EV_READ);
+        if (http_should_keep_alive(&cd->parser.req)) {
+			//printf("http_parser_reset\n");
+            http_parser_reset(&cd->parser);
+        } else {
+			//printf("conn_del\n");
+            conn_del(cd->fd);
+        }
+    } else {
+        event_mod(cd->loopfd, cd->fd, EV_WRITE);
     }
 }
 
