@@ -15,9 +15,9 @@ async function fetchPosts(pageNum, count = 10) {
     'https://picsum.photos/400/600?random='
   ];
   const sampleVideos = [
-    'https://sample-videos.com/video123/mp4/720/big_buck_bunny_720p_1mb.mp4',
-    'https://sample-videos.com/video123/mp4/720/big_buck_bunny_720p_2mb.mp4',
-    'https://sample-videos.com/video123/mp4/720/big_buck_bunny_720p_5mb.mp4'
+    'clip1.mp4',
+    'clip2.mp4',
+    'clip3.mp4'
   ];
 
   const longText = `This is a very long text post to demonstrate the expand/shrink feature. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.`;
@@ -87,7 +87,9 @@ function renderPostContent(post) {
     if (item.type === 'image') {
       return `<img class="post-media-single" src="${item.url}" alt="Post media">`;
     } else {
-      return `<video class="post-media-single" controls src="${item.url}"></video>`;
+      // Added poster attribute using a placeholder image (picsum for demo)
+      // Replace with actual thumbnails if available, or generate client-side
+      return `<video class="post-media-single" controls poster="https://picsum.photos/600/600?random=${item.url}" src="${item.url}"></video>`;
     }
   } else if (post.type === 'multi-media' && post.media.length) {
     const count = post.media.length;
@@ -96,7 +98,8 @@ function renderPostContent(post) {
       if (item.type === 'image') {
         html += `<img src="${item.url}" alt="Post media">`;
       } else {
-        html += `<video controls src="${item.url}"></video>`;
+        // Added poster attribute for multi-media videos too
+        html += `<video controls poster="https://picsum.photos/300/300?random=${item.url}" src="${item.url}"></video>`;
       }
     });
     html += `</div>`;
@@ -110,6 +113,7 @@ function renderPostContent(post) {
 function createPost(postData) {
   const postEl = document.createElement('div');
   postEl.className = 'post';
+  postEl.dataset.postId = postData.id;
 
   const commentsHtml = postData.comments.length > 0
     ? `<div class="comments">
@@ -135,7 +139,7 @@ function createPost(postData) {
         ${renderPostContent(postData)}
       </div>
       <div class="actions">
-        <button class="action-btn">❤️ Like</button>
+        <button class="action-btn like-btn" data-liked="false">♡ Like</button>
         <button class="action-btn">💬 Comment</button>
         <button class="action-btn">↗️ Share</button>
       </div>
@@ -160,6 +164,26 @@ function createPost(postData) {
         toggleBtn.className = 'show-more';
       }
     };
+  }
+  // Like button interaction
+  const likeBtn = postEl.querySelector('.like-btn');
+  if (likeBtn) {
+	 likeBtn.onclick = () => {
+	   const isLiked = likeBtn.dataset.liked === 'true';
+	   const postId = postData.id;
+
+	   // Fake backend call
+	   console.log(`User ${isLiked ? 'unliked' : 'liked'} post ${postId}`);
+	   // In a real app: await fetch(`/api/posts/${postId}/like`, { method: isLiked ? 'DELETE' : 'POST' });
+
+	   if (isLiked) {
+		 likeBtn.dataset.liked = 'false';
+		 likeBtn.innerHTML = '♡ Like';
+	   } else {
+		 likeBtn.dataset.liked = 'true';
+		 likeBtn.innerHTML = '❤️ Liked';
+	   }
+     };
   }
 
   return postEl;

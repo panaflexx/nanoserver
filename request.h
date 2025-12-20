@@ -174,6 +174,7 @@ static inline const char *get_mime_type(const char *path) {
         {".gif", "image/gif"},
         {".svg", "image/svg+xml"},
         {".txt", "text/plain"},
+        {".mp4", "video/mp4"},
         {NULL, NULL}
     };
 
