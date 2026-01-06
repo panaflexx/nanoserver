@@ -539,7 +539,7 @@ static inline void my_on_accept(int loopfd, int local_s, struct server_sockets *
         } else if (ret <= 0) {
             int sslerr = SSL_get_error(clients[idx].ssl, ret);
             if (sslerr != SSL_ERROR_WANT_READ && sslerr != SSL_ERROR_WANT_WRITE) {
-                fprintf(stderr, "SSL_accept failed: %d\n", sslerr);
+                //fprintf(stderr, "SSL_accept failed: %d\n", sslerr);
                 ERR_print_errors_fp(stderr);
                 conn_del(c);
                 return;
@@ -591,7 +591,7 @@ static inline void my_on_read(int loopfd, int fd, struct event_handlers *handler
                     conn_del(fd);
                     return;
                 }
-                fprintf(stderr, "SSL_read failed: %d\n", sslerr);
+                //fprintf(stderr, "SSL_read failed: %d\n", sslerr);
                 ERR_print_errors_fp(stderr);
                 my_on_error(loopfd, fd, sslerr, handlers);
                 conn_del(fd);
@@ -1050,7 +1050,7 @@ static inline void default_on_disconnect(int loopfd, int fd) {
 }
 
 static inline void default_on_error(int loopfd, int fd, int err) {
-    fprintf(stderr, "Error on fd %d: %d\n", fd, err);
+    //fprintf(stderr, "Error on fd %d: %d\n", fd, err);
 #ifdef HAVE_OPENSSL
     ERR_print_errors_fp(stderr);
 #endif

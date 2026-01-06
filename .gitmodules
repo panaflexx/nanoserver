@@ -1,0 +1,3 @@
+[submodule "ext/mquickjs"]
+	path = ext/mquickjs
+	url = https://github.com/bellard/mquickjs.git
